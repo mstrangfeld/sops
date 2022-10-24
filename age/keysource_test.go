@@ -100,6 +100,31 @@ func TestAge(t *testing.T) {
 
 }
 
+func TestAgeSSH(t *testing.T) {
+	assert := assert.New(t)
+
+	sshRecipient := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDZX8R/cPc4LVztDFyEOtKSq1DJ0GGicEzrDebNIGRlm Testing"
+	keys, err := MasterKeysFromRecipients(sshRecipient)
+
+	assert.NoError(err)
+	assert.Equal(len(keys), 1)
+
+	dataKey := []byte("abcdefghijklmnopqrstuvwxyz123456")
+
+	for _, key := range keys {
+		err = key.Encrypt(dataKey)
+		assert.NoError(err)
+
+		_, filename, _, _ := runtime.Caller(0)
+		err = os.Setenv("SOPS_AGE_SSH_PRIVATE_KEY", path.Join(path.Dir(filename), "ssh_private_key"))
+		assert.NoError(err)
+
+		decryptedKey, err := key.Decrypt()
+		assert.NoError(err)
+		assert.Equal(dataKey, decryptedKey)
+	}
+}
+
 func TestAgeDotEnv(t *testing.T) {
 	assert := assert.New(t)
 

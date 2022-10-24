@@ -2,16 +2,20 @@ package age
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"filippo.io/age"
+	"filippo.io/age/agessh"
 	"filippo.io/age/armor"
 	"github.com/sirupsen/logrus"
 	"go.mozilla.org/sops/v3/logging"
+	"golang.org/x/crypto/ssh"
 )
 
 var log *logrus.Logger
@@ -22,6 +26,7 @@ func init() {
 
 const SopsAgeKeyEnv = "SOPS_AGE_KEY"
 const SopsAgeKeyFileEnv = "SOPS_AGE_KEY_FILE"
+const SopsAgeSshPrivateKeyEnv = "SOPS_AGE_SSH_PRIVATE_KEY"
 
 // MasterKey is an age key used to encrypt and decrypt sops' data key.
 type MasterKey struct {
@@ -29,7 +34,7 @@ type MasterKey struct {
 	Recipient    string // a Bech32-encoded public key
 	EncryptedKey string // a sops data key encrypted with age
 
-	parsedRecipient *age.X25519Recipient // a parsed age public key
+	parsedRecipient age.Recipient // a parsed age public key
 }
 
 // Encrypt takes a sops data key, encrypts it with age and stores the result in the EncryptedKey field.
@@ -94,16 +99,13 @@ func (key *MasterKey) SetEncryptedDataKey(enc []byte) {
 	key.EncryptedKey = string(enc)
 }
 
-// Decrypt decrypts the EncryptedKey field with the age identity and returns the result.
-func (key *MasterKey) Decrypt() ([]byte, error) {
+func getAgeIdentities() ([]age.Identity, error) {
 	var ageKeyReader io.Reader
-	var ageKeyReaderName string
 
 	if ageKeyReader == nil {
 		ageKey, ok := os.LookupEnv(SopsAgeKeyEnv)
 		if ok {
 			ageKeyReader = strings.NewReader(ageKey)
-			ageKeyReaderName = "environment variable"
 		}
 	}
 
@@ -116,7 +118,6 @@ func (key *MasterKey) Decrypt() ([]byte, error) {
 			}
 			defer ageKeyFile.Close()
 			ageKeyReader = ageKeyFile
-			ageKeyReaderName = ageKeyFilePath
 		}
 	}
 
@@ -126,19 +127,123 @@ func (key *MasterKey) Decrypt() ([]byte, error) {
 			return nil, fmt.Errorf("user config directory could not be determined: %w", err)
 		}
 		ageKeyFilePath := filepath.Join(userConfigDir, "sops", "age", "keys.txt")
+		if _, err := os.Stat(ageKeyFilePath); errors.Is(err, os.ErrNotExist) {
+			// Exit silently when the file does not exist
+			return nil, nil
+		}
 		ageKeyFile, err := os.Open(ageKeyFilePath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open file: %w", err)
 		}
 		defer ageKeyFile.Close()
 		ageKeyReader = ageKeyFile
-		ageKeyReaderName = ageKeyFilePath
 	}
 
-	identities, err := age.ParseIdentities(ageKeyReader)
+	if ageKeyReader == nil {
+		return nil, nil
+	}
 
+	return age.ParseIdentities(ageKeyReader)
+}
+
+func readPublicKeyFile(privateKeyPath string) (ssh.PublicKey, error) {
+	publicKeyPath := privateKeyPath + ".pub"
+	f, err := os.Open(publicKeyPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to obtain public %q key for %q SSH key: %w", publicKeyPath, privateKeyPath, err)
+	}
+	defer f.Close()
+	contents, err := ioutil.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %q: %w", publicKeyPath, err)
+	}
+	pubKey, _, _, _, err := ssh.ParseAuthorizedKey(contents)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse %q: %w", publicKeyPath, err)
+	}
+	return pubKey, nil
+}
+
+func getAgeSshIdentityFromPrivateKeyFile(keyPath string) (age.Identity, error) {
+	keyFile, err := os.Open(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer keyFile.Close()
+	contents, err := ioutil.ReadAll(keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	id, err := agessh.ParseIdentity(contents)
+	if sshErr, ok := err.(*ssh.PassphraseMissingError); ok {
+		pubKey := sshErr.PublicKey
+		if pubKey == nil {
+			pubKey, err = readPublicKeyFile(keyPath)
+			if err != nil {
+				return nil, err
+			}
+		}
+		passphrasePrompt := func() ([]byte, error) {
+			pass, err := readPassphrase(fmt.Sprintf("Enter passphrase for %q:", keyPath))
+			if err != nil {
+				return nil, fmt.Errorf("could not read passphrase for %q: %v", keyPath, err)
+			}
+			return pass, nil
+		}
+		i, err := agessh.NewEncryptedSSHIdentity(pubKey, contents, passphrasePrompt)
+		if err != nil {
+			return nil, fmt.Errorf("could not create encrypted SSH identity: %w", err)
+		}
+		return i, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("malformed SSH identity in %q: %w", keyPath, err)
+	}
+	return id, nil
+}
+
+func getAgeSshIdentity() (age.Identity, error) {
+	sshKeyFilePath, ok := os.LookupEnv(SopsAgeSshPrivateKeyEnv)
+	if ok {
+		return getAgeSshIdentityFromPrivateKeyFile(sshKeyFilePath)
+	}
+
+	userHomeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("user home directory could not be determined: %w", err)
+	}
+
+	sshEd25519PrivateKeyPath := filepath.Join(userHomeDir, ".ssh", "id_ed25519")
+	if _, err := os.Stat(sshEd25519PrivateKeyPath); err == nil {
+		return getAgeSshIdentityFromPrivateKeyFile(sshEd25519PrivateKeyPath)
+	}
+
+	sshRsaPrivateKeyPath := filepath.Join(userHomeDir, ".ssh", "id_rsa")
+	if _, err := os.Stat(sshEd25519PrivateKeyPath); err == nil {
+		return getAgeSshIdentityFromPrivateKeyFile(sshRsaPrivateKeyPath)
+	}
+
+	return nil, nil
+}
+
+// Decrypt decrypts the EncryptedKey field with the age identity and returns the result.
+func (key *MasterKey) Decrypt() ([]byte, error) {
+	var identities []age.Identity
+
+	ageIdentities, err := getAgeIdentities()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read age identities: %w", err)
+	}
+	identities = append(identities, ageIdentities...)
+
+	ageSshIdentity, err := getAgeSshIdentity()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read age ssh identities: %w", err)
+	}
+	identities = append(identities, ageSshIdentity)
+
+	if len(identities) < 1 {
+		return nil, fmt.Errorf("no age identity found")
 	}
 
 	src := bytes.NewReader([]byte(key.EncryptedKey))
@@ -146,7 +251,7 @@ func (key *MasterKey) Decrypt() ([]byte, error) {
 	r, err := age.Decrypt(ar, identities...)
 
 	if err != nil {
-		return nil, fmt.Errorf("no age identity found in %q that could decrypt the data", ageKeyReaderName)
+		return nil, fmt.Errorf("no age identity found that could decrypt the data")
 	}
 
 	var b bytes.Buffer
@@ -167,7 +272,7 @@ func (key *MasterKey) ToString() string {
 	return key.Recipient
 }
 
-// ToMap converts the MasterKey to a map for serialization purposes.
+// ToMap converts the MasterKey to a map for seriazation purposes.
 func (key *MasterKey) ToMap() map[string]interface{} {
 	return map[string]interface{}{"recipient": key.Recipient, "enc": key.EncryptedKey}
 }
@@ -212,12 +317,22 @@ func masterKeyFromRecipient(recipient string) (*MasterKey, error) {
 }
 
 // parseRecipient attempts to parse a string containing an encoded age public key
-func parseRecipient(recipient string) (*age.X25519Recipient, error) {
-	parsedRecipient, err := age.ParseX25519Recipient(recipient)
+func parseRecipient(recipient string) (age.Recipient, error) {
+	switch {
+	case strings.HasPrefix(recipient, "age1"):
+		parsedRecipient, err := age.ParseX25519Recipient(recipient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse input as Bech32-encoded age public key: %w", err)
+		}
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse input as Bech32-encoded age public key: %w", err)
+		return parsedRecipient, nil
+	case strings.HasPrefix(recipient, "ssh-"):
+		parsedRecipient, err := agessh.ParseRecipient(recipient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse input as age-ssh public key: %w", err)
+		}
+		return parsedRecipient, nil
 	}
 
-	return parsedRecipient, nil
+	return nil, fmt.Errorf("failed to parse input, unknown recipient type: %q", recipient)
 }
